@@ -12,7 +12,8 @@ from marshmallow import validates
 from marshmallow.validate import Email
 
 from bless.config.bless_config import USERNAME_VALIDATION_OPTION, REMOTE_USERNAMES_VALIDATION_OPTION, \
-    USERNAME_VALIDATION_DEFAULT, REMOTE_USERNAMES_VALIDATION_DEFAULT
+    USERNAME_VALIDATION_DEFAULT, REMOTE_USERNAMES_VALIDATION_DEFAULT, REMOTE_USERNAMES_BLACKLIST_OPTION, \
+    REMOTE_USERNAMES_BLACKLIST_DEFAULT
 
 # man 8 useradd
 USERNAME_PATTERN = re.compile('[a-z_][a-z0-9_-]*[$]?\Z')
@@ -35,7 +36,7 @@ USERNAME_VALIDATION_OPTIONS = Enum('UserNameValidationOptions',
                                    'useradd '  # Allowable usernames per 'man 8 useradd'
                                    'debian '  # Allowable usernames on debian systems.
                                    'email '  # username is a valid email address.
-                                   'principal '  # SSH Certificate Principal.  See 'man 5 sshd_con#  fig'.
+                                   'principal '  # SSH Certificate Principal.  See 'man 5 sshd_config'.
                                    'disabled')  # no additional validation of the string.
 
 
@@ -47,7 +48,11 @@ def validate_ips(ips):
         raise ValidationError('Invalid IP address.')
 
 
-def validate_user(user, username_validation):
+def validate_user(user, username_validation, username_blacklist=None):
+    if username_blacklist:
+        if re.match(username_blacklist, user) is not None:
+            raise ValidationError('Username contains invalid characters.')
+
     if username_validation == USERNAME_VALIDATION_OPTIONS.disabled:
         return
     elif username_validation == USERNAME_VALIDATION_OPTIONS.email:
@@ -120,8 +125,12 @@ class BlessUserSchema(Schema):
             username_validation = USERNAME_VALIDATION_OPTIONS[self.context[REMOTE_USERNAMES_VALIDATION_OPTION]]
         else:
             username_validation = USERNAME_VALIDATION_OPTIONS[REMOTE_USERNAMES_VALIDATION_DEFAULT]
+        if REMOTE_USERNAMES_BLACKLIST_OPTION in self.context:
+            username_blacklist = self.context[REMOTE_USERNAMES_BLACKLIST_OPTION]
+        else:
+            username_blacklist = REMOTE_USERNAMES_BLACKLIST_DEFAULT
         for remote_username in remote_usernames.split(','):
-            validate_user(remote_username, username_validation)
+            validate_user(remote_username, username_validation, username_blacklist)
 
 
 class BlessUserRequest:
@@ -153,6 +162,7 @@ class BlessUserRequest:
 
 
 class BlessHostSchema(Schema):
+    # todo: Is there meaningful host name validation we can perform?
     hostnames = fields.Str(required=True)
     public_key_to_sign = fields.Str(validate=validate_ssh_public_key, required=True)
 
@@ -171,7 +181,7 @@ class BlessHostRequest:
     def __init__(self, hostnames, public_key_to_sign):
         """
         A BlessRequest must have the following key value pairs to be valid.
-        :param hostnames: The hostnames to make valid for this host certificate.
+        :param hostnames: Comma-separated list of the hostnames for this certificate.
         :param public_key_to_sign: The id_rsa.pub that will be used in the SSH request. This is enforced in the issued certificate.
         """
         self.hostnames = hostnames

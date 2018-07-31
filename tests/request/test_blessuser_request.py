@@ -1,8 +1,10 @@
 import pytest
+from bless.config.bless_config import USERNAME_VALIDATION_OPTION, REMOTE_USERNAMES_VALIDATION_OPTION, \
+    REMOTE_USERNAMES_BLACKLIST_OPTION
+from bless.request.bless_request import validate_ips, validate_user, USERNAME_VALIDATION_OPTIONS, BlessUserSchema
+
 from marshmallow import ValidationError
 
-from bless.config.bless_config import USERNAME_VALIDATION_OPTION, REMOTE_USERNAMES_VALIDATION_OPTION
-from bless.request.bless_request import validate_ips, validate_user, USERNAME_VALIDATION_OPTIONS, BlessUserSchema
 
 
 def test_validate_ips():
@@ -63,11 +65,24 @@ def test_validate_user_debian_too_long():
     ('user,invalid'),
     ('user invalid'),
     ('user\tinvalid'),
-    ('user\ninvalid'),
+    ('user\ninvalid')
 ])
 def test_validate_user_debian_invalid(test_input):
     with pytest.raises(ValidationError) as e:
         validate_user(test_input, USERNAME_VALIDATION_OPTIONS.debian)
+    assert str(e.value) == 'Username contains invalid characters.'
+
+
+@pytest.mark.parametrize("test_input", [
+    ('root'),
+    ("admin"),
+    ("administrator"),
+    ('balrog'),
+    ("teal'c")
+])
+def test_validate_user_blacklist(test_input):
+    with pytest.raises(ValidationError) as e:
+        validate_user(test_input, USERNAME_VALIDATION_OPTIONS.principal, 'root|admin.*|balrog|.+\'.*')
     assert str(e.value) == 'Username contains invalid characters.'
 
 
@@ -133,6 +148,7 @@ def test_validate_multiple_principals(test_input):
     schema = BlessUserSchema()
     schema.context[USERNAME_VALIDATION_OPTION] = USERNAME_VALIDATION_OPTIONS.principal.name
     schema.context[REMOTE_USERNAMES_VALIDATION_OPTION] = USERNAME_VALIDATION_OPTIONS.principal.name
+    schema.context[REMOTE_USERNAMES_BLACKLIST_OPTION] = 'balrog'
     schema.validate_remote_usernames(test_input)
 
 

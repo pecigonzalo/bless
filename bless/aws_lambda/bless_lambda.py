@@ -3,19 +3,15 @@
     :copyright: (c) 2016 by Netflix Inc., see AUTHORS for more
     :license: Apache, see LICENSE for more details.
 """
-import base64
+
 import logging
 import os
 import time
 from datetime import timedelta
 
 import boto3
-from botocore.exceptions import ClientError
-from kmsauth import KMSTokenValidator, TokenValidationError
-from marshmallow.exceptions import ValidationError
-
-from bless.config.bless_config import BlessConfig, \
-    BLESS_OPTIONS_SECTION, \
+from bless.cache.bless_lambda_cache import BlessLambdaCache
+from bless.config.bless_config import BLESS_OPTIONS_SECTION, \
     CERTIFICATE_VALIDITY_BEFORE_SEC_OPTION, \
     CERTIFICATE_VALIDITY_AFTER_SEC_OPTION, \
     ENTROPY_MINIMUM_BITS_OPTION, \
@@ -25,15 +21,26 @@ from bless.config.bless_config import BlessConfig, \
     KMSAUTH_SECTION, \
     KMSAUTH_USEKMSAUTH_OPTION, \
     KMSAUTH_REMOTE_USERNAMES_ALLOWED_OPTION, \
+    VALIDATE_REMOTE_USERNAMES_AGAINST_IAM_GROUPS_OPTION, \
     KMSAUTH_SERVICE_ID_OPTION, \
     TEST_USER_OPTION, \
     CERTIFICATE_EXTENSIONS_OPTION, \
-    REMOTE_USERNAMES_VALIDATION_OPTION
+    REMOTE_USERNAMES_VALIDATION_OPTION, \
+    IAM_GROUP_NAME_VALIDATION_FORMAT_OPTION, \
+    REMOTE_USERNAMES_BLACKLIST_OPTION
 from bless.request.bless_request import BlessHostSchema, BlessUserSchema
 from bless.ssh.certificate_authorities.ssh_certificate_authority_factory import \
     get_ssh_certificate_authority
 from bless.ssh.certificates.ssh_certificate_builder import SSHCertificateType
 from bless.ssh.certificates.ssh_certificate_builder_factory import get_ssh_certificate_builder
+from kmsauth import KMSTokenValidator, TokenValidationError
+from marshmallow.exceptions import ValidationError
+
+global_bless_cache = None
+
+
+def lambda_handler(event, context=None, ca_private_key_password=None, entropy_check=True, config_file=None):
+    return lambda_handler_user(event, context, ca_private_key_password, entropy_check, config_file)
 
 
 def lambda_handler_host(
@@ -48,21 +55,21 @@ def lambda_handler_host(
     :param ca_private_key_password: For local testing, if the password is provided, skip the KMS
     decrypt.
     :param entropy_check: For local testing, if set to false, it will skip checking entropy and
-    won't try to fetch additional random from KMS
-    :param config_file: The config file to load the SSH CA private key from, and additional settings
+    won't try to fetch additional random from KMS.
+    :param config_file: The config file to load the SSH CA private key from, and additional settings.
     :return: the SSH Certificate that can be written to id_rsa-cert.pub or similar file.
     """
+    bless_cache = setup_lambda_cache(ca_private_key_password, config_file)
+
     # AWS Region determines configs related to KMS
-    region = os.environ['AWS_REGION']
+    region = bless_cache.region
 
     # Load the deployment config values
-    config = BlessConfig(region,
-                         config_file=config_file)
+    config = bless_cache.config
 
     logger = set_logger(config)
 
     ca_private_key = config.getprivatekey()
-    password_ciphertext_b64 = config.getpassword()
 
     # Process cert request
     schema = BlessHostSchema(strict=True)
@@ -72,21 +79,22 @@ def lambda_handler_host(
     except ValidationError as e:
         return error_response('InputValidationError', str(e))
 
+    # todo: kmsauth of hostnames? Other server to hostnames validation?
     logger.info('Bless lambda invoked by [public_key: {}]'.format(request.public_key_to_sign))
 
-    # Decrypt ca private key password
-    if ca_private_key_password is None:
-        try:
-            ca_private_key_password = decrypt_ca_password(password_ciphertext_b64)
-        except ClientError as e:
-            return error_response('ClientError', str(e))
+    # Make sure we have the ca private key password
+    if bless_cache.ca_private_key_password is None:
+        return error_response('ClientError', bless_cache.ca_private_key_password_error)
+    else:
+        ca_private_key_password = bless_cache.ca_private_key_password
 
     # if running as a Lambda, we can check the entropy pool and seed it with KMS if desired
     if entropy_check:
         check_entropy(config, logger)
 
-        # cert values determined only by lambda and its configs
+    # cert values determined only by lambda and its configs
     current_time = int(time.time())
+    # todo: config server cert validity range
     valid_before = current_time + int(timedelta(days=365).total_seconds())  # Host certificate is valid for at least 1 year
     valid_after = current_time
 
@@ -103,12 +111,16 @@ def lambda_handler_host(
         context.aws_request_id, cert_builder.ssh_public_key.fingerprint, context.invoked_function_arn,
         time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(valid_before))
     )
-    cert_builder.add_valid_principal(request.hostnames)
+
+    # todo: verify multiple hostnames are supported in server certs
+    for hostname in request.hostnames.split(','):
+        cert_builder.add_valid_principal(hostname)
+
     cert_builder.set_key_id(key_id)
     cert = cert_builder.get_cert_file()
 
     logger.info(
-        'Issued a cert to hostnames[{}] with key_id[{}] and '
+        'Issued a server cert to hostnames[{}] with key_id[{}] and '
         'valid_from[{}])'.format(
             request.hostnames, key_id,
             time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(valid_after))))
@@ -131,12 +143,13 @@ def lambda_handler_user(
     :param config_file: The config file to load the SSH CA private key from, and additional settings
     :return: the SSH Certificate that can be written to id_rsa-cert.pub or similar file.
     """
+    bless_cache = setup_lambda_cache(ca_private_key_password, config_file)
+
     # AWS Region determines configs related to KMS
-    region = os.environ['AWS_REGION']
+    region = bless_cache.region
 
     # Load the deployment config values
-    config = BlessConfig(region,
-                         config_file=config_file)
+    config = bless_cache.config
 
     logger = set_logger(config)
 
@@ -144,10 +157,7 @@ def lambda_handler_user(
                                                         CERTIFICATE_VALIDITY_BEFORE_SEC_OPTION)
     certificate_validity_after_seconds = config.getint(BLESS_OPTIONS_SECTION,
                                                        CERTIFICATE_VALIDITY_AFTER_SEC_OPTION)
-    entropy_minimum_bits = config.getint(BLESS_OPTIONS_SECTION, ENTROPY_MINIMUM_BITS_OPTION)
-    random_seed_bytes = config.getint(BLESS_OPTIONS_SECTION, RANDOM_SEED_BYTES_OPTION)
     ca_private_key = config.getprivatekey()
-    password_ciphertext_b64 = config.getpassword()
     certificate_extensions = config.get(BLESS_OPTIONS_SECTION, CERTIFICATE_EXTENSIONS_OPTION)
 
     # Process cert request
@@ -155,6 +165,8 @@ def lambda_handler_user(
     schema.context[USERNAME_VALIDATION_OPTION] = config.get(BLESS_OPTIONS_SECTION, USERNAME_VALIDATION_OPTION)
     schema.context[REMOTE_USERNAMES_VALIDATION_OPTION] = config.get(BLESS_OPTIONS_SECTION,
                                                                     REMOTE_USERNAMES_VALIDATION_OPTION)
+    schema.context[REMOTE_USERNAMES_BLACKLIST_OPTION] = config.get(BLESS_OPTIONS_SECTION,
+                                                                   REMOTE_USERNAMES_BLACKLIST_OPTION)
 
     try:
         request = schema.load(event).data
@@ -167,12 +179,11 @@ def lambda_handler_user(
         request.public_key_to_sign,
         request.kmsauth_token))
 
-    # Decrypt ca private key password
-    if ca_private_key_password is None:
-        try:
-            ca_private_key_password = decrypt_ca_password(password_ciphertext_b64)
-        except ClientError as e:
-            return error_response('ClientError', str(e))
+    # Make sure we have the ca private key password
+    if bless_cache.ca_private_key_password is None:
+        return error_response('ClientError', bless_cache.ca_private_key_password_error)
+    else:
+        ca_private_key_password = bless_cache.ca_private_key_password
 
     # if running as a Lambda, we can check the entropy pool and seed it with KMS if desired
     if entropy_check:
@@ -203,6 +214,27 @@ def lambda_handler_user(
                 if allowed_users != ['*'] and not all([u in allowed_users for u in requested_remotes]):
                     return error_response('KMSAuthValidationError',
                                           'unallowed remote_usernames [{}]'.format(request.remote_usernames))
+
+                # Check if the user is in the required IAM groups
+                if config.get(KMSAUTH_SECTION, VALIDATE_REMOTE_USERNAMES_AGAINST_IAM_GROUPS_OPTION):
+                    iam = boto3.client('iam')
+                    user_groups = iam.list_groups_for_user(UserName=request.bastion_user)
+
+                    group_name_template = config.get(KMSAUTH_SECTION, IAM_GROUP_NAME_VALIDATION_FORMAT_OPTION)
+                    for requested_remote in requested_remotes:
+                        required_group_name = group_name_template.format(requested_remote)
+
+                        user_is_in_group = any(
+                            group
+                            for group in user_groups['Groups']
+                            if group['GroupName'] == required_group_name
+                        )
+
+                        if not user_is_in_group:
+                            return error_response('KMSAuthValidationError',
+                                                  'user {} is not in the {} iam group'.format(request.bastion_user,
+                                                                                              required_group_name))
+
             elif request.remote_usernames != request.bastion_user:
                 return error_response('KMSAuthValidationError',
                                       'remote_usernames must be the same as bastion_user')
@@ -281,17 +313,6 @@ def set_logger(config):
     return logger
 
 
-def decrypt_ca_password(password_ciphertext_b64):
-    """
-    Decrypt ca private key password
-    """
-    region = os.environ['AWS_REGION']
-    kms_client = boto3.client('kms', region_name=region)
-    ca_password = kms_client.decrypt(
-        CiphertextBlob=base64.b64decode(password_ciphertext_b64))
-    return ca_password['Plaintext']
-
-
 def check_entropy(config, logger):
     """
     Check the entropy pool and seed it with KMS if desired
@@ -314,3 +335,16 @@ def check_entropy(config, logger):
             random_seed = response['Plaintext']
             with open('/dev/urandom', 'w') as urandom:
                 urandom.write(random_seed)
+
+
+def setup_lambda_cache(ca_private_key_password, config_file):
+    # For testing, ignore the static bless_cache, otherwise fill the cache one time.
+    global global_bless_cache
+    if ca_private_key_password is not None or config_file is not None:
+        bless_cache = BlessLambdaCache(ca_private_key_password, config_file)
+    elif global_bless_cache is None:
+        global_bless_cache = BlessLambdaCache(config_file=os.path.join(os.path.dirname(__file__), 'bless_deploy.cfg'))
+        bless_cache = global_bless_cache
+    else:
+        bless_cache = global_bless_cache
+    return bless_cache
