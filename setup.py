@@ -23,14 +23,5 @@ setup(
         'ipaddress',
         'marshmallow',
         'kmsauth'
-    ],
-    extras_require={
-        'tests': [
-            'coverage',
-            'flake8',
-            'pyflakes',
-            'pytest',
-            'pytest-mock'
-        ]
-    }
+    ]
 )
